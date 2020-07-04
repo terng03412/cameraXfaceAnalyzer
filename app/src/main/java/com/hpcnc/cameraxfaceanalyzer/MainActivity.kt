@@ -1,6 +1,7 @@
 package com.hpcnc.cameraxfaceanalyzer
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.*
@@ -9,7 +10,6 @@ import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
-import android.view.View
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -19,8 +19,10 @@ import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.google.firebase.ml.vision.FirebaseVision
 import com.google.firebase.ml.vision.common.FirebaseVisionImage
 import com.google.firebase.ml.vision.common.FirebaseVisionImageMetadata
+import com.google.firebase.ml.vision.face.FirebaseVisionFaceDetectorOptions
 import kotlinx.android.synthetic.main.activity_main.*
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
@@ -57,6 +59,12 @@ class MainActivity : AppCompatActivity() {
         .setFormat(FirebaseVisionImageMetadata.IMAGE_FORMAT_NV21 )
         .setRotation(degreesToFirebaseRotation(90))
         .build()
+
+    val realTimeOpts: FirebaseVisionFaceDetectorOptions = FirebaseVisionFaceDetectorOptions.Builder()
+        .setPerformanceMode(FirebaseVisionFaceDetectorOptions.FAST)
+        .build()
+
+    private val faceDetector = FirebaseVision.getInstance().getVisionFaceDetector(realTimeOpts)
 
     private fun degreesToFirebaseRotation(degrees: Int): Int = when(degrees) {
         0 -> FirebaseVisionImageMetadata.ROTATION_0
@@ -102,7 +110,15 @@ class MainActivity : AppCompatActivity() {
 
     }
 
+    private val detector by lazy {
+        GenderDetector(
+            tflite,
+            FileUtil.loadLabels(this, LABELS_PATH)
+        )
+    }
+
     /** Declare and bind preview and analysis use cases */
+    @SuppressLint("UnsafeExperimentalUsageError")
     private fun bindCameraUseCases() = view_finder.post {
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -137,7 +153,7 @@ class MainActivity : AppCompatActivity() {
                         image.width, image.height, Bitmap.Config.ARGB_8888)
                 }
 
-                val bitmap = toBitmap( image?.image!! )
+                val bitmap = toBitmap( image.image!! )
                 val inputImage = FirebaseVisionImage.fromByteArray( BitmaptoNv21( bitmap ) , metadata )
 
 
@@ -148,15 +164,41 @@ class MainActivity : AppCompatActivity() {
                     return@Analyzer
                 }
 
+                faceDetector.detectInImage(inputImage)
+                    .addOnSuccessListener { faces ->
+                        Thread {
+                            for (face in faces) {
+
+                                try {
+                                    var FaceBB = face.boundingBox
+                                    var faceBitmap = cropRectFromBitmap( bitmap , FaceBB , true )
+                                    bitmapBuffer = Bitmap.createBitmap(
+                                        faceBitmap.width, faceBitmap.height, Bitmap.Config.ARGB_8888)
+
+                                    // Convert the image to RGB and place it in our shared buffer
+                                    image.use { converter.yuvToRgb(faceBitmap as Image, bitmapBuffer) }
+                                    // Process the image in Tensorflow
+                                    val tfImage =  tfImageProcessor.process(tfImageBuffer.apply { load(bitmapBuffer) })
+
+                                    // Perform the object detection for the current frame
+//                                    val predictions = detector.predict(tfImage)
+
+                                }
+                                catch ( e : Exception ) {
+                                    // If any exception occurs if this box and continue with the next boxes.
+                                    continue
+                                }
+                            }
+                        }.start()
+                    }
+                    .addOnFailureListener { e ->
+                        e.message?.let { Log.e("Error", it) }
+                    }
 
 
                 // Convert the image to RGB and place it in our shared buffer
-                image.use { converter.yuvToRgb(image.image!!, bitmapBuffer) }
+//                image.use { converter.yuvToRgb(image.image!!, bitmapBuffer) }
 
-
-
-                // Process the image in Tensorflow
-//                val tfImage =  tfImageProcessor.process(tfImageBuffer.apply { load(bitmapBuffer) })
 
 
             })
@@ -173,6 +215,22 @@ class MainActivity : AppCompatActivity() {
             preview.setSurfaceProvider(view_finder.createSurfaceProvider())
 
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun cropRectFromBitmap(source: Bitmap, rect: Rect , preRotate : Boolean ): Bitmap {
+        return Bitmap.createBitmap(
+            if ( preRotate ) rotateBitmap( source , 90f )!! else source,
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height()
+        )
+    }
+
+    private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap? {
+        val matrix = Matrix()
+        matrix.postRotate( angle )
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix , false )
     }
 
     private fun BitmaptoNv21( bitmap: Bitmap ): ByteArray {
@@ -211,6 +269,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+
 
 
     private fun toBitmap( image : Image): Bitmap {
